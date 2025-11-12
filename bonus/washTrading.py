@@ -1107,7 +1107,7 @@ if __name__ == "__main__":
         top_n_accounts=15,
         
         # 출력 디렉토리
-        output_dir="./bonus/output"
+        output_dir="./output/bonus"
     )
     
     # 실행
