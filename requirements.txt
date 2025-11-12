@@ -1,2 +1,6 @@
 pandas
 duckdb
+matplotlib
+seaborn
+numpy
+openpyxl
