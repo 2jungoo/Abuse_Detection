@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from enum import Enum
 import logging
+from common.data_manager import get_data_manager
 from collections import defaultdict
 
 # ============================================================================
@@ -257,35 +258,7 @@ class DetectionLogger:
 # ============================================================================
 # 3. DATA PIPELINE
 # ============================================================================
-
-class DataLoader:
-    """데이터 로드 및 전처리"""
-    
-    def __init__(self, filepath: str):
-        self.filepath = filepath
-        self.data = {}
-        self.con = dd.connect()
-        print(f"데이터 로더 초기화: {filepath}")
-    
-    def load_excel_data(self) -> Dict[str, pd.DataFrame]:
-        """Excel 파일에서 모든 시트 로드 및 DuckDB 등록"""
-        print("데이터 로드 중...")
-        
-        sheets = ['Trade', 'Funding', 'Reward', 'IP', 'Spec']
-        for sheet_name in sheets:
-            try:
-                df = pd.read_excel(self.filepath, sheet_name=sheet_name)
-                self.data[sheet_name] = df
-                self.con.register(sheet_name, df)
-                print(f"  - {sheet_name}: {len(df)} rows")
-            except Exception as e:
-                print(f"  - {sheet_name} 로드 실패: {e}")
-        print("✓ 데이터 로드 완료")
-        return self.data
-    
-    def get_connection(self):
-        """DuckDB 연결 반환"""
-        return self.con
+# DataLoader removed - using common.data_manager.DataManager singleton instead.
 
 
 class PositionBuilder:
@@ -400,8 +373,8 @@ class FilterEngine:
                 row['filter_failures'] = failures
                 failed_data.append(row)
                 
-                if self.config.enable_detailed_logging:
-                    print(f"{pair_id} 필터 실패: {', '.join(failures)}")
+                # if self.config.enable_detailed_logging:
+                #     print(f"{pair_id} 필터 실패: {', '.join(failures)}")
         
         print(f"필터 완료: {len(passed_pairs)}/{len(candidate_pairs)} 통과")
         
@@ -499,13 +472,13 @@ class ScoringEngine:
             # Tier 분류
             pair.tier = self._classify_tier(pair.score.total)
             
-            if self.config.enable_detailed_logging:
-                print(
-                    f"{pair.pair_id}: 점수={pair.score.total:.1f} "
-                    f"(PnL:{pnl_score:.1f}, Conc:{conc_score:.1f}, "
-                    f"Qty:{qty_score:.1f}, Ratio:{ratio_score:.1f}) "
-                    f"→ {pair.tier.value}"
-                )
+            # if self.config.enable_detailed_logging:
+            #     print(
+            #         f"{pair.pair_id}: 점수={pair.score.total:.1f} "
+            #         f"(PnL:{pnl_score:.1f}, Conc:{conc_score:.1f}, "
+            #         f"Qty:{qty_score:.1f}, Ratio:{ratio_score:.1f}) "
+            #         f"→ {pair.tier.value}"
+            #     )
         
         print(f"점수 계산 완료: {len(pairs)}개")
         
@@ -1107,10 +1080,10 @@ class BonusLaunderingDetector:
         """
         print("데이터 로드")
         
-        # 1. 데이터 로드
-        loader = DataLoader(data_filepath)
-        loader.load_excel_data()
-        con = loader.get_connection()
+        # 1. 데이터 로드 (공통 DataManager 사용)
+        dm = get_data_manager(data_filepath)
+        dm.get_all_sheets()
+        con = dm.get_connection()
         
         # 2. 포지션 구성
         print("포지션 구성")
