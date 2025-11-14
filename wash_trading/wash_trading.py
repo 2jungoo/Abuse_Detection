@@ -45,7 +45,7 @@ class DetectionConfig:
     """탐지 설정 및 하이퍼파라미터"""
     
     # ===== Filter Parameters (필수 조건) =====
-    time_since_bonus_hours: float = 72.0      # 보너스 후 거래 시간 창 (72시간)
+    time_since_bonus_hours: float = 36.0      # 보너스 후 거래 시간 창 (36시간)
     concurrency_threshold_sec: float = 30.0    # 거래 동시성 임계값 (30초)
     quantity_tolerance_pct: float = 0.02       # 수량 허용 오차 (±2%)
     
@@ -61,7 +61,7 @@ class DetectionConfig:
     suspicious_threshold: int = 50        # Suspicious 최소 점수
     
     # ===== Network Analysis Parameters =====
-    min_profit_occurrences: int = 2       # 제재 대상 최소 수익 횟수
+    min_profit_occurrences: int = 3       # 제재 대상 최소 수익 횟수
     max_network_depth: int = 5            # 네트워크 탐색 최대 깊이
     
     # ===== Output Settings =====

@@ -182,8 +182,240 @@ class DataAggregator:
             },
         }
     
+    def get_detections(self) -> List[Dict[str, Any]]:
+        """모든 탐지 케이스 통합 반환 (제재 여부 포함)"""
+        from common.data_manager import get_data_manager
+        
+        all_data = self.get_all_data()
+        detections = []
+        
+        # DuckDB 연결하여 실제 거래 시간 가져오기
+        try:
+            dm = get_data_manager()
+            con = dm.get_connection(persistent=True)
+        except Exception as e:
+            print(f"Warning: Failed to connect to DuckDB: {e}")
+            con = None
+        
+        # 제재 케이스 ID 맵 생성
+        sanction_ids = set()
+        sanction_map = {}  # case_id -> sanction info
+        
+        # Bonus sanctions 매핑
+        bonus_sanctions = all_data['bonus'].get('sanctions', {})
+        if bonus_sanctions and 'cases' in bonus_sanctions:
+            for case in bonus_sanctions['cases']:
+                for pair_id in case.get('trade_pair_ids', []):
+                    sanction_ids.add(pair_id)
+                    sanction_map[pair_id] = {
+                        'sanction_id': case.get('case_id', ''),
+                        'sanction_type': case.get('sanction_type', ''),
+                        'is_sanctioned': True
+                    }
+        
+        # Funding sanctions 매핑
+        funding_sanctions = all_data['funding'].get('sanctions', {})
+        if funding_sanctions and 'sanctions' in funding_sanctions:
+            for sanction in funding_sanctions['sanctions']:
+                for case_id in sanction.get('hunter_case_ids', []):
+                    sanction_ids.add(case_id)
+                    sanction_map[case_id] = {
+                        'sanction_id': sanction.get('case_id', ''),
+                        'sanction_type': sanction.get('sanction_type', ''),
+                        'is_sanctioned': True
+                    }
+        
+        # Cooperative sanctions 매핑
+        coop_sanctions = all_data['cooperative'].get('sanctions', {})
+        if coop_sanctions and 'sanctions' in coop_sanctions:
+            for sanction in coop_sanctions['sanctions']:
+                for pair_id in sanction.get('trade_pair_ids', []):
+                    sanction_ids.add(pair_id)
+                    sanction_map[pair_id] = {
+                        'sanction_id': sanction.get('case_id', ''),
+                        'sanction_type': sanction.get('sanction_type', ''),
+                        'is_sanctioned': True
+                    }
+        
+        # Bonus 탐지 케이스 (모든 trade pairs)
+        bonus_pairs = all_data['bonus'].get('trade_pairs', [])
+        if bonus_pairs:
+            # 계정/심볼 기반으로 실제 거래 시간 가져오기
+            account_symbol_pairs = []
+            for pair in bonus_pairs:
+                loser = pair.get('loser_account')
+                symbol = pair.get('symbol')
+                if loser and symbol:
+                    account_symbol_pairs.append((loser, symbol))
+            
+            # DB에서 시간 정보 가져오기 (loser 계정 기준)
+            pair_times = {}
+            if con and account_symbol_pairs:
+                try:
+                    # 각 (account, symbol) 조합의 최소 시간 가져오기
+                    for account, symbol in account_symbol_pairs:
+                        query = f"""
+                            SELECT MIN(ts) as open_time
+                            FROM Trade
+                            WHERE account_id = '{account}' AND symbol = '{symbol}'
+                        """
+                        result = con.execute(query).fetchone()
+                        if result and result[0]:
+                            pair_times[(account, symbol)] = result[0]
+                except Exception as e:
+                    print(f"Warning: Failed to fetch trade times for wash trading: {e}")
+            
+            for pair in bonus_pairs:
+                pair_id = pair.get('pair_id', '')
+                sanction_info = sanction_map.get(pair_id, {})
+                
+                # 실제 거래 시간 사용 (loser의 계정/심볼 기준)
+                loser = pair.get('loser_account')
+                symbol = pair.get('symbol')
+                timestamp = pair_times.get((loser, symbol)) if loser and symbol else None
+                if timestamp:
+                    # datetime 객체를 Unix timestamp (밀리초)로 변환
+                    if isinstance(timestamp, datetime):
+                        timestamp_ms = int(timestamp.timestamp() * 1000)
+                    else:
+                        timestamp_ms = int(datetime.fromisoformat(str(timestamp)).timestamp() * 1000)
+                else:
+                    # fallback: 현재 시간
+                    timestamp_ms = int(datetime.now().timestamp() * 1000)
+                
+                detections.append({
+                    'id': pair_id,
+                    'model': 'wash',
+                    'timestamp': timestamp_ms,
+                    'type': pair.get('tier', ''),
+                    'accounts': [pair.get('winner_account', ''), pair.get('loser_account', '')],
+                    'score': float(pair.get('total_score', 0)),
+                    'is_sanctioned': sanction_info.get('is_sanctioned', False),
+                    'sanction_id': sanction_info.get('sanction_id', ''),
+                    'sanction_type': sanction_info.get('sanction_type', ''),
+                    'details': f"Tier: {pair.get('tier', '')}, Laundered: ${pair.get('laundered_amount', 0):.2f}",
+                    'laundered_amount': float(pair.get('laundered_amount', 0)),
+                    'raw': pair,
+                })
+        
+        # Funding 탐지 케이스
+        funding_cases = all_data['funding'].get('cases', [])
+        if funding_cases:
+            # position_id로 실제 거래 시간 가져오기 (배치 조회)
+            position_ids = [case.get('position_id') for case in funding_cases if case.get('position_id')]
+            
+            # DB에서 시간 정보 가져오기
+            position_times = {}
+            if con and position_ids:
+                try:
+                    position_ids_str = ', '.join([f"'{pid}'" for pid in position_ids])
+                    query = f"""
+                        SELECT position_id, MIN(ts) as open_time
+                        FROM Trade
+                        WHERE position_id IN ({position_ids_str})
+                        GROUP BY position_id
+                    """
+                    result = con.execute(query).fetchall()
+                    for row in result:
+                        if row[0] and row[1]:
+                            position_times[row[0]] = row[1]
+                except Exception as e:
+                    print(f"Warning: Failed to fetch trade times for funding fee: {e}")
+            
+            for case in funding_cases:
+                case_id = case.get('case_id', '')
+                sanction_info = sanction_map.get(case_id, {})
+                
+                # 실제 거래 시간 사용
+                position_id = case.get('position_id')
+                timestamp = position_times.get(position_id) if position_id else None
+                if timestamp:
+                    # datetime 객체를 Unix timestamp (밀리초)로 변환
+                    if isinstance(timestamp, datetime):
+                        timestamp_ms = int(timestamp.timestamp() * 1000)
+                    else:
+                        timestamp_ms = int(datetime.fromisoformat(str(timestamp)).timestamp() * 1000)
+                else:
+                    timestamp_ms = int(datetime.now().timestamp() * 1000)
+                
+                detections.append({
+                    'id': case_id,
+                    'model': 'funding',
+                    'timestamp': timestamp_ms,
+                    'type': case.get('severity', ''),
+                    'accounts': [case.get('account_id', '')],
+                    'score': float(case.get('total_score', 0)),
+                    'is_sanctioned': sanction_info.get('is_sanctioned', False),
+                    'sanction_id': sanction_info.get('sanction_id', ''),
+                    'sanction_type': sanction_info.get('sanction_type', ''),
+                    'details': f"Severity: {case.get('severity', '')}, Funding: ${case.get('window_funding', 0):.2f}",
+                    'window_funding': float(case.get('window_funding', 0)),
+                    'raw': case,
+                })
+        
+        # Cooperative 탐지 케이스
+        coop_pairs = all_data['cooperative'].get('trade_pairs', [])
+        if coop_pairs:
+            # 계정/심볼 기반으로 실제 거래 시간 가져오기
+            account_symbol_pairs = []
+            for pair in coop_pairs:
+                account1 = pair.get('account_id1')
+                symbol = pair.get('symbol')
+                if account1 and symbol:
+                    account_symbol_pairs.append((account1, symbol))
+            
+            # DB에서 시간 정보 가져오기
+            pair_times = {}
+            if con and account_symbol_pairs:
+                try:
+                    for account, symbol in account_symbol_pairs:
+                        query = f"""
+                            SELECT MIN(ts) as open_time
+                            FROM Trade
+                            WHERE account_id = '{account}' AND symbol = '{symbol}'
+                        """
+                        result = con.execute(query).fetchone()
+                        if result and result[0]:
+                            pair_times[(account, symbol)] = result[0]
+                except Exception as e:
+                    print(f"Warning: Failed to fetch trade times for cooperative: {e}")
+            
+            for pair in coop_pairs:
+                pair_id = pair.get('pair_id', '')
+                sanction_info = sanction_map.get(pair_id, {})
+                
+                # 실제 거래 시간 사용 (account1의 계정/심볼 기준)
+                account1 = pair.get('account_id1')
+                symbol = pair.get('symbol')
+                timestamp = pair_times.get((account1, symbol)) if account1 and symbol else None
+                if timestamp:
+                    # datetime 객체를 Unix timestamp (밀리초)로 변환
+                    if isinstance(timestamp, datetime):
+                        timestamp_ms = int(timestamp.timestamp() * 1000)
+                    else:
+                        timestamp_ms = int(datetime.fromisoformat(str(timestamp)).timestamp() * 1000)
+                else:
+                    timestamp_ms = int(datetime.now().timestamp() * 1000)
+                
+                detections.append({
+                    'id': pair_id,
+                    'model': 'cooperative',
+                    'timestamp': timestamp_ms,
+                    'type': pair.get('risk_level', ''),
+                    'accounts': [pair.get('account_id1', ''), pair.get('account_id2', '')],
+                    'score': float(pair.get('total_score', 0)),
+                    'is_sanctioned': sanction_info.get('is_sanctioned', False),
+                    'sanction_id': sanction_info.get('sanction_id', ''),
+                    'sanction_type': sanction_info.get('sanction_type', ''),
+                    'details': f"Risk: {pair.get('risk_level', '')}, PNL: ${pair.get('total_pnl', 0):.2f}",
+                    'total_pnl': float(pair.get('total_pnl', 0)),
+                    'raw': pair,
+                })
+        
+        return detections
+    
     def get_sanctions(self) -> List[Dict[str, Any]]:
-        """모든 제재 케이스 통합 반환"""
+        """모든 제재 케이스만 반환"""
         all_data = self.get_all_data()
         sanctions = []
         
@@ -207,119 +439,88 @@ class DataAggregator:
         
         # Funding sanctions
         funding_sanctions = all_data['funding'].get('sanctions', {})
-        if funding_sanctions and 'accounts' in funding_sanctions:
-            for account in funding_sanctions['accounts']:
+        if funding_sanctions and 'sanctions' in funding_sanctions:
+            for sanction in funding_sanctions['sanctions']:
                 sanctions.append({
-                    'id': f"FUNDING_{account.get('account_id', '')}",
+                    'id': sanction.get('case_id', ''),
                     'model': 'funding',
-                    'timestamp': datetime.now().isoformat(),
-                    'type': 'SANCTION_ACCOUNT',
-                    'accounts': [account.get('account_id', '')],
-                    'score': account.get('avg_score', 0),
-                    'details': f"반복 펀딩비 악용 ({account.get('total_cases', 0)}건)",
-                    'total_funding_profit': account.get('total_funding_profit', 0),
-                    'critical_count': account.get('critical_count', 0),
-                    'high_count': account.get('high_count', 0),
-                    'raw': account,
+                    'timestamp': sanction.get('detection_timestamp', datetime.now()).isoformat() if isinstance(sanction.get('detection_timestamp'), datetime) else str(sanction.get('detection_timestamp', datetime.now().isoformat())),
+                    'type': sanction.get('sanction_type', ''),
+                    'accounts': [sanction.get('account_id', '')],
+                    'score': sanction.get('total_score', 0),
+                    'details': sanction.get('evidence_summary', ''),
+                    'total_funding_profit': sanction.get('total_funding_profit', 0),
+                    'hunter_case_ids': sanction.get('hunter_case_ids', []),
+                    'raw': sanction,
                 })
         
         # Cooperative sanctions
         coop_sanctions = all_data['cooperative'].get('sanctions', {})
-        if coop_sanctions and 'groups' in coop_sanctions:
-            for group in coop_sanctions['groups']:
+        if coop_sanctions and 'sanctions' in coop_sanctions:
+            for sanction in coop_sanctions['sanctions']:
                 sanctions.append({
-                    'id': group.get('group_id', ''),
+                    'id': sanction.get('case_id', ''),
                     'model': 'cooperative',
-                    'timestamp': datetime.now().isoformat(),
-                    'type': 'COOPERATIVE_GROUP',
-                    'accounts': group.get('members', []),
-                    'score': group.get('avg_score', 0),
-                    'risk_level': group.get('risk_level', ''),
-                    'details': f"공모 그룹 ({len(group.get('members', []))}명, {group.get('trade_count', 0)}건 거래)",
-                    'pnl_total': group.get('pnl_total', 0),
-                    'shared_ip_count': group.get('shared_ip_count', 0),
-                    'raw': group,
+                    'timestamp': sanction.get('detection_timestamp', datetime.now()).isoformat() if isinstance(sanction.get('detection_timestamp'), datetime) else str(sanction.get('detection_timestamp', datetime.now().isoformat())),
+                    'type': sanction.get('sanction_type', ''),
+                    'accounts': sanction.get('account_ids', []),
+                    'score': sanction.get('avg_score', 0),
+                    'details': sanction.get('evidence_summary', ''),
+                    'trade_pair_ids': sanction.get('trade_pair_ids', []),
+                    'raw': sanction,
                 })
         
         return sanctions
     
     def get_timeseries_data(self) -> List[Dict[str, Any]]:
-        """시계열 데이터 생성 - 데이터베이스에서 직접 조회"""
-        from common.data_manager import get_data_manager
+        """시계열 데이터 생성 - 실제 탐지된 케이스 기반"""
+        from datetime import datetime, timedelta
         import pandas as pd
         
         timeseries = defaultdict(lambda: {'WASH_TRADING': 0, 'FUNDING_FEE': 0, 'COOPERATIVE': 0})
         
         try:
-            dm = get_data_manager()
-            con = dm.get_connection(persistent=True)
+            # 모든 탐지 케이스 가져오기
+            detections = self.get_detections()
             
-            # 1. Wash Trading (Bonus) - Trade 테이블에서 보너스 관련 거래 조회
-            try:
-                # Reward 테이블과 조인하여 보너스 후 거래 찾기
-                # Reward 테이블에는 position_side가 없으므로 단순히 시간 조건만 체크
-                wash_query = """
-                SELECT 
-                    DATE_TRUNC('hour', CAST(t.ts AS TIMESTAMP)) as hour,
-                    COUNT(*) as count
-                FROM Trade t
-                INNER JOIN Reward r ON t.account_id = r.account_id
-                WHERE CAST(t.ts AS TIMESTAMP) > CAST(r.ts AS TIMESTAMP)
-                    AND CAST(t.ts AS TIMESTAMP) <= CAST(r.ts AS TIMESTAMP) + INTERVAL '72 hours'
-                GROUP BY DATE_TRUNC('hour', CAST(t.ts AS TIMESTAMP))
-                """
-                wash_df = con.execute(wash_query).fetchdf()
-                
-                for _, row in wash_df.iterrows():
-                    if pd.notna(row['hour']):
-                        hour_key = int(pd.to_datetime(row['hour']).timestamp())
-                        timeseries[hour_key]['WASH_TRADING'] += int(row['count'])
-            except Exception as e:
-                print(f"Warning: Wash trading timeseries query failed: {e}")
-            
-            # 2. Funding Fee - Funding 테이블에서 조회
-            try:
-                funding_query = """
-                SELECT 
-                    DATE_TRUNC('hour', CAST(ts AS TIMESTAMP)) as hour,
-                    COUNT(*) as count
-                FROM Funding
-                WHERE funding_fee != 0
-                GROUP BY DATE_TRUNC('hour', CAST(ts AS TIMESTAMP))
-                """
-                funding_df = con.execute(funding_query).fetchdf()
-                
-                for _, row in funding_df.iterrows():
-                    if pd.notna(row['hour']):
-                        hour_key = int(pd.to_datetime(row['hour']).timestamp())
-                        timeseries[hour_key]['FUNDING_FEE'] += int(row['count'])
-            except Exception as e:
-                print(f"Warning: Funding fee timeseries query failed: {e}")
-            
-            # 3. Cooperative Trading - Trade 테이블에서 동시 거래 찾기
-            try:
-                # 간단히 모든 거래를 시간별로 집계 (실제로는 쌍을 이루는 거래만 계산해야 하지만, 근사치로 사용)
-                coop_query = """
-                SELECT 
-                    DATE_TRUNC('hour', CAST(ts AS TIMESTAMP)) as hour,
-                    COUNT(DISTINCT position_id) as count
-                FROM Trade
-                WHERE position_id IS NOT NULL
-                GROUP BY DATE_TRUNC('hour', CAST(ts AS TIMESTAMP))
-                HAVING COUNT(DISTINCT account_id) > 1
-                """
-                coop_df = con.execute(coop_query).fetchdf()
-                
-                for _, row in coop_df.iterrows():
-                    if pd.notna(row['hour']):
-                        hour_key = int(pd.to_datetime(row['hour']).timestamp())
-                        # 협력 거래는 과대 계산되지 않도록 조정
-                        timeseries[hour_key]['COOPERATIVE'] += max(1, int(row['count']) // 10)
-            except Exception as e:
-                print(f"Warning: Cooperative timeseries query failed: {e}")
+            for detection in detections:
+                try:
+                    # timestamp를 시간 단위로 내림 (hour truncate)
+                    if isinstance(detection['timestamp'], str):
+                        dt = datetime.fromisoformat(detection['timestamp'].replace('Z', '+00:00'))
+                    else:
+                        dt = datetime.fromtimestamp(detection['timestamp'] / 1000)
+                    
+                    # 시간 단위로 내림
+                    hour_dt = dt.replace(minute=0, second=0, microsecond=0)
+                    hour_key = int(hour_dt.timestamp())
+                    
+                    # 모델별로 카운트
+                    if detection['model'] == 'wash':
+                        timeseries[hour_key]['WASH_TRADING'] += 1
+                    elif detection['model'] == 'funding':
+                        timeseries[hour_key]['FUNDING_FEE'] += 1
+                    elif detection['model'] == 'cooperative':
+                        timeseries[hour_key]['COOPERATIVE'] += 1
+                        
+                except Exception as e:
+                    print(f"Warning: Failed to process detection {detection.get('id')}: {e}")
+                    continue
                 
         except Exception as e:
             print(f"Error generating timeseries data: {e}")
+        
+        # 데이터가 없는 시간대도 0으로 채우기
+        if timeseries:
+            min_timestamp = min(timeseries.keys())
+            max_timestamp = max(timeseries.keys())
+            
+            # 1시간 간격으로 모든 시간대 생성
+            current_timestamp = min_timestamp
+            while current_timestamp <= max_timestamp:
+                if current_timestamp not in timeseries:
+                    timeseries[current_timestamp] = {'WASH_TRADING': 0, 'FUNDING_FEE': 0, 'COOPERATIVE': 0}
+                current_timestamp += 3600  # 1시간 = 3600초
         
         # 정렬 및 포맷
         result = []
@@ -364,19 +565,33 @@ class DataAggregator:
                     if avg_score:
                         account_map[account_id]['scores'].append(avg_score)
         
-        # Bonus pairs - winner accounts
+        # Bonus pairs - both winner and loser accounts
         bonus_pairs = all_data['bonus'].get('trade_pairs', [])
         if bonus_pairs:
             for pair in bonus_pairs:
                 winner = pair.get('winner_account', '')
+                loser = pair.get('loser_account', '')
+                score = pair.get('total_score', 0)
+                
+                # Winner account (이익을 본 계정)
                 if winner:
                     account_map[winner]['account_id'] = winner
                     account_map[winner]['total_cases'] += 1
-                    account_map[winner]['profits']['wash'] += pair.get('laundered_amount', 0)
-                    account_map[winner]['total_profit_loss'] += pair.get('laundered_amount', 0)
-                    score = pair.get('total_score', 0)
+                    winner_pnl = pair.get('winner_pnl', 0)
+                    account_map[winner]['profits']['wash'] += winner_pnl
+                    account_map[winner]['total_profit_loss'] += winner_pnl
                     if score:
                         account_map[winner]['scores'].append(score)
+                
+                # Loser account (손실을 본 계정)
+                if loser:
+                    account_map[loser]['account_id'] = loser
+                    account_map[loser]['total_cases'] += 1
+                    loser_pnl = pair.get('loser_pnl', 0)
+                    account_map[loser]['profits']['wash'] += loser_pnl
+                    account_map[loser]['total_profit_loss'] += loser_pnl
+                    if score:
+                        account_map[loser]['scores'].append(score)
         
         # Cooperative groups - all members
         coop_groups = all_data['cooperative'].get('groups', [])
@@ -473,6 +688,56 @@ class DataAggregator:
         Note: 현재는 탐지된 거래만 반환. 
         전체 거래 이력은 별도 데이터베이스 쿼리 필요.
         """
+        from common.data_manager import get_data_manager
+        
+        # 먼저 DuckDB에서 실제 거래 데이터를 조회
+        try:
+            dm = get_data_manager()
+            con = dm.get_connection(persistent=True)
+            
+            # Trade 테이블에서 해당 계정의 거래 조회 (컬럼명 수정)
+            query = f"""
+                SELECT 
+                    position_id as trade_id,
+                    account_id,
+                    ts as timestamp,
+                    symbol,
+                    side,
+                    position_id,
+                    leverage,
+                    price,
+                    qty as quantity,
+                    amount
+                FROM Trade
+                WHERE account_id = '{account_id}'
+                ORDER BY ts DESC
+                LIMIT 1000
+            """
+            
+            result = con.execute(query).fetchall()
+            
+            if result:
+                trades = []
+                for row in result:
+                    trades.append({
+                        'trade_id': row[0] if row[0] else f'TRADE_{len(trades)}',
+                        'account_id': row[1],
+                        'timestamp': str(row[2]),  # timestamp를 문자열로 변환
+                        'symbol': row[3],
+                        'side': row[4],
+                        'position_id': row[5] if row[5] else '',
+                        'leverage': float(row[6]) if row[6] else 1.0,
+                        'price': float(row[7]) if row[7] else 0.0,
+                        'quantity': float(row[8]) if row[8] else 0.0,
+                        'amount': float(row[9]) if row[9] else 0.0,
+                    })
+                return trades
+        except Exception as e:
+            print(f"Error querying trades from database: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # DB 조회 실패 시 기존 방식 사용
         all_data = self.get_all_data()
         trades = []
         
@@ -484,14 +749,14 @@ class DataAggregator:
                     trades.append({
                         'trade_id': pair.get('pair_id', ''),
                         'account_id': account_id,
-                        'timestamp': pair.get('loser_open_ts', ''),
+                        'timestamp': str(datetime.now().isoformat()),
                         'symbol': pair.get('symbol', ''),
                         'side': 'LONG' if pair.get('loser_side') == 'LONG' else 'SHORT',
                         'position_id': '',
-                        'leverage': pair.get('leverage', 0),
-                        'price': pair.get('loser_open_price', 0),
-                        'quantity': pair.get('loser_quantity', 0),
-                        'amount': pair.get('laundered_amount', 0),
+                        'leverage': float(pair.get('leverage', 0)),
+                        'price': float(pair.get('loser_open_price', 0)),
+                        'quantity': float(pair.get('loser_quantity', 0)),
+                        'amount': float(pair.get('laundered_amount', 0)),
                         'model': 'wash',
                         'raw': pair
                     })
@@ -508,10 +773,10 @@ class DataAggregator:
                         'symbol': case.get('symbol', ''),
                         'side': case.get('side', ''),
                         'position_id': case.get('position_id', ''),
-                        'leverage': case.get('leverage', 0),
-                        'price': case.get('open_price', 0),
-                        'quantity': case.get('amount', 0),
-                        'amount': case.get('total_funding', 0),
+                        'leverage': float(case.get('leverage', 0)),
+                        'price': float(case.get('open_price', 0)),
+                        'quantity': float(case.get('amount', 0)),
+                        'amount': float(case.get('total_funding', 0)),
                         'model': 'funding',
                         'raw': case
                     })
@@ -528,9 +793,9 @@ class DataAggregator:
                         'symbol': pair.get('symbol', ''),
                         'side': pair.get('side1', ''),
                         'position_id': '',
-                        'leverage': pair.get('leverage1', 0),
-                        'price': pair.get('open_price1', 0),
-                        'quantity': pair.get('quantity1', 0),
+                        'leverage': float(pair.get('leverage1', 0)),
+                        'price': float(pair.get('open_price1', 0)),
+                        'quantity': float(pair.get('quantity1', 0)),
                         'amount': 0,
                         'model': 'cooperative',
                         'raw': pair
@@ -543,9 +808,9 @@ class DataAggregator:
                         'symbol': pair.get('symbol', ''),
                         'side': pair.get('side2', ''),
                         'position_id': '',
-                        'leverage': pair.get('leverage2', 0),
-                        'price': pair.get('open_price2', 0),
-                        'quantity': pair.get('quantity2', 0),
+                        'leverage': float(pair.get('leverage2', 0)),
+                        'price': float(pair.get('open_price2', 0)),
+                        'quantity': float(pair.get('quantity2', 0)),
                         'amount': 0,
                         'model': 'cooperative',
                         'raw': pair

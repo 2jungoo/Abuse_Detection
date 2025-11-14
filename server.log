@@ -1,0 +1,8 @@
+INFO:     Will watch for changes in these directories: ['/Users/urous3814/Develop/Singapore_final/Singapore_back']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [59991] using WatchFiles
+INFO:     Started server process [60004]
+INFO:     Waiting for application startup.
+2025-11-14 13:25:25,091 - INFO - ======================================================================
+2025-11-14 13:25:25,091 - INFO - 증정금 녹이기 탐지 시스템 시작
+2025-11-14 13:25:25,091 - INFO - ======================================================================

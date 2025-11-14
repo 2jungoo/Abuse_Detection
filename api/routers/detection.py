@@ -33,6 +33,52 @@ async def get_stats():
         raise HTTPException(status_code=500, detail=f"Error getting stats: {str(e)}")
 
 
+@router.get("/detections")
+async def get_detections(
+    model: Optional[str] = Query(None, description="Filter by model: wash, funding, cooperative"),
+    limit: Optional[int] = Query(None, description="Limit number of results"),
+):
+    """
+    모든 탐지 케이스 통합 리스트 (제재 여부 포함)
+    
+    Parameters:
+        - model: 필터링할 모델 (wash, funding, cooperative)
+        - limit: 반환할 최대 개수
+    
+    Returns:
+        List of detections with:
+        - id: 탐지 케이스 ID
+        - model: 모델 유형 (wash, funding, cooperative)
+        - timestamp: 탐지 시간
+        - type: 탐지 유형
+        - accounts: 관련 계정 리스트
+        - score: 점수
+        - is_sanctioned: 제재 여부
+        - sanction_id: 제재 케이스 ID (제재된 경우)
+        - sanction_type: 제재 유형 (제재된 경우)
+        - details: 상세 설명
+        - raw: 원본 데이터
+    """
+    try:
+        aggregator = get_aggregator()
+        detections = aggregator.get_detections()
+        
+        # 모델 필터링
+        if model:
+            detections = [d for d in detections if d['model'] == model]
+        
+        # 점수 기준 정렬 (높은 순)
+        detections = sorted(detections, key=lambda x: x.get('score', 0), reverse=True)
+        
+        # 제한
+        if limit:
+            detections = detections[:limit]
+        
+        return detections
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting detections: {str(e)}")
+
+
 @router.get("/sanctions")
 async def get_sanctions(
     model: Optional[str] = Query(None, description="Filter by model: wash, funding, cooperative"),

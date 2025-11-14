@@ -39,6 +39,13 @@ class RiskLevel(Enum):
     LOW = "LOW"                # 낮은 의심
 
 
+class SanctionType(Enum):
+    """제재 유형"""
+    IMMEDIATE_CRITICAL = "IMMEDIATE_CRITICAL"      # Critical 즉시 제재
+    IP_SHARED_NETWORK = "IP_SHARED_NETWORK"        # IP 공유 네트워크
+    REPEATED_PATTERN = "REPEATED_PATTERN"          # 반복 패턴
+
+
 @dataclass
 class DetectionConfig:
     """탐지 설정 및 하이퍼파라미터"""
@@ -177,6 +184,42 @@ class CooperativeGroup:
         """딕셔너리로 변환"""
         data = asdict(self)
         data['risk_level'] = self.risk_level.value
+        return data
+
+
+@dataclass
+class SanctionCase:
+    """제재 케이스"""
+    case_id: str
+    sanction_type: SanctionType
+    group_id: str
+    account_ids: List[str]
+    detection_timestamp: datetime
+    
+    # 증거 데이터
+    trade_pair_ids: List[str]
+    total_score: float
+    risk_level: RiskLevel
+    
+    # IP 정보
+    shared_ip_count: int = 0
+    shared_ips: Dict[str, List[str]] = field(default_factory=dict)
+    
+    # 패턴 정보
+    pattern_count: Optional[int] = None
+    
+    # 추가 메타데이터
+    total_pnl: float = 0.0
+    pnl_positive_sum: float = 0.0
+    pnl_negative_sum: float = 0.0
+    evidence_summary: str = ""
+    
+    def to_dict(self) -> Dict:
+        """딕셔너리로 변환"""
+        data = asdict(self)
+        data['sanction_type'] = self.sanction_type.value
+        data['risk_level'] = self.risk_level.value
+        data['detection_timestamp'] = self.detection_timestamp.isoformat()
         return data
 
 
@@ -693,7 +736,117 @@ class NetworkAnalyzer:
 
 
 # ============================================================================
-# 8. REPORTING & VISUALIZATION
+# 8. SANCTION PIPELINE
+# ============================================================================
+
+class SanctionPipeline:
+    """제재 케이스 생성 및 출력"""
+    
+    def __init__(self, config: DetectionConfig, logger: DetectionLogger):
+        self.config = config
+        self.logger = logger
+        self.sanction_cases: List[SanctionCase] = []
+    
+    def process_critical_groups(self, groups: List[CooperativeGroup]) -> List[SanctionCase]:
+        """Critical 그룹 즉시 제재 케이스 생성"""
+        print("Critical 그룹 제재 생성 중...")
+        
+        critical_groups = [g for g in groups if g.risk_level == RiskLevel.CRITICAL]
+        
+        if len(critical_groups) == 0:
+            print("Critical 그룹 없음")
+            return []
+        
+        for group in critical_groups:
+            sanction = SanctionCase(
+                case_id=f"SANCTION_CRITICAL_{group.group_id}",
+                sanction_type=SanctionType.IMMEDIATE_CRITICAL,
+                group_id=group.group_id,
+                account_ids=group.members,
+                detection_timestamp=datetime.now(),
+                trade_pair_ids=group.trade_pair_ids,
+                total_score=group.max_score,
+                risk_level=RiskLevel.CRITICAL,
+                shared_ip_count=group.shared_ip_count,
+                shared_ips=group.shared_ips,
+                total_pnl=group.pnl_total,
+                pnl_positive_sum=group.pnl_positive_sum,
+                pnl_negative_sum=group.pnl_negative_sum,
+                evidence_summary=f"확실한 공모 거래 패턴 (점수: {group.max_score:.1f}/100, 거래: {group.trade_count}건)"
+            )
+            
+            self.sanction_cases.append(sanction)
+            self.logger.logger.warning(f"제재 케이스 생성: {sanction.case_id}")
+        
+        print(f"Critical 제재: {len(critical_groups)}건")
+        
+        return [c for c in self.sanction_cases if c.sanction_type == SanctionType.IMMEDIATE_CRITICAL]
+    
+    def process_ip_shared_groups(self, groups: List[CooperativeGroup]) -> List[SanctionCase]:
+        """IP 공유 네트워크 제재 케이스 생성"""
+        print("IP 공유 네트워크 제재 케이스 생성 중...")
+        
+        # HIGH 위험도 + IP 공유가 있는 그룹
+        ip_shared_groups = [
+            g for g in groups
+            if g.risk_level == RiskLevel.HIGH 
+            and g.shared_ip_count >= self.config.min_shared_ips
+        ]
+        
+        ip_sanctions = []
+        
+        for group in ip_shared_groups:
+            # 이미 Critical로 제재된 경우 스킵
+            if any(c.group_id == group.group_id and c.sanction_type == SanctionType.IMMEDIATE_CRITICAL 
+                   for c in self.sanction_cases):
+                continue
+            
+            sanction = SanctionCase(
+                case_id=f"SANCTION_IP_{group.group_id}",
+                sanction_type=SanctionType.IP_SHARED_NETWORK,
+                group_id=group.group_id,
+                account_ids=group.members,
+                detection_timestamp=datetime.now(),
+                trade_pair_ids=group.trade_pair_ids,
+                total_score=group.avg_score,
+                risk_level=RiskLevel.HIGH,
+                shared_ip_count=group.shared_ip_count,
+                shared_ips=group.shared_ips,
+                total_pnl=group.pnl_total,
+                pnl_positive_sum=group.pnl_positive_sum,
+                pnl_negative_sum=group.pnl_negative_sum,
+                evidence_summary=f"IP 공유 네트워크 ({group.shared_ip_count}개 IP 공유, 거래: {group.trade_count}건)"
+            )
+            
+            ip_sanctions.append(sanction)
+            self.sanction_cases.append(sanction)
+            self.logger.logger.warning(f"제재 케이스 생성: {sanction.case_id}")
+        
+        print(f"IP 공유 제재: {len(ip_sanctions)}건")
+        
+        return ip_sanctions
+    
+    def export_sanctions(self, output_dir: Path) -> str:
+        """제재 케이스를 JSON 파일로 출력"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filepath = output_dir / "sanction_groups.json"
+        
+        data = {
+            'total_sanction_groups': len(self.sanction_cases),
+            'generated_at': datetime.now().isoformat(),
+            'sanctions': [case.to_dict() for case in self.sanction_cases]
+        }
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        print(f"제재 케이스 저장: {filepath} ({len(self.sanction_cases)}건)")
+        
+        return str(filepath)
+
+
+# ============================================================================
+# 9. REPORTING & VISUALIZATION
 # ============================================================================
 
 class ReportGenerator:
@@ -724,9 +877,6 @@ class ReportGenerator:
         
         # 4. 요약 보고서 (텍스트)
         self._generate_summary_report(all_pairs, groups)
-        
-        # 5. 제재 대상 그룹 (JSON)
-        self._export_sanction_groups(groups)
         
         print("보고서 생성 완료")
     
@@ -908,32 +1058,10 @@ class ReportGenerator:
         
         print(f"요약 보고서 저장: {filepath}")
         print(report)
-    
-    def _export_sanction_groups(self, groups: List[CooperativeGroup]):
-        """제재 대상 그룹 JSON"""
-        
-        # Critical 또는 IP 공유가 있는 HIGH 그룹
-        sanction_groups = [
-            g for g in groups
-            if g.risk_level == RiskLevel.CRITICAL 
-            or (g.risk_level == RiskLevel.HIGH and g.shared_ip_count >= self.config.min_shared_ips)
-        ]
-        
-        sanction_data = {
-            'total_sanction_groups': len(sanction_groups),
-            'generated_at': datetime.now().isoformat(),
-            'groups': [g.to_dict() for g in sanction_groups]
-        }
-        
-        filepath = self.output_dir / "sanction_groups.json"
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(sanction_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"제재 그룹 저장: {filepath} ({len(sanction_groups)}개)")
 
 
 # ============================================================================
-# 9. MAIN DETECTOR ENGINE
+# 10. MAIN DETECTOR ENGINE
 # ============================================================================
 
 class CooperativeTradingDetector:
@@ -942,6 +1070,7 @@ class CooperativeTradingDetector:
     def __init__(self, config: DetectionConfig):
         self.config = config
         self.logger = DetectionLogger(config)
+        self.sanction_pipeline = SanctionPipeline(config, self.logger)
     
     def detect(self, data_filepath: str) -> Dict:
         """전체 탐지 프로세스 실행"""
@@ -994,12 +1123,25 @@ class CooperativeTradingDetector:
         network_analyzer = NetworkAnalyzer(self.config, data['IP'])
         groups = network_analyzer.find_groups(scored_pairs)
         
-        # 6. 보고서 생성
+        # 6. Critical 그룹 즉시 제재
+        self.logger.log_phase("Critical 그룹 제재")
+        critical_sanctions = self.sanction_pipeline.process_critical_groups(groups)
+        
+        # 7. IP 공유 네트워크 제재
+        self.logger.log_phase("IP 공유 네트워크 제재")
+        ip_sanctions = self.sanction_pipeline.process_ip_shared_groups(groups)
+        
+        # 8. 제재 케이스 출력
+        self.logger.log_phase("제재 케이스 출력")
+        sanction_file = self.sanction_pipeline.export_sanctions(Path(self.config.output_dir))
+        
+        # 9. 보고서 생성
         self.logger.log_phase("보고서 생성")
         report_generator = ReportGenerator(self.config)
         report_generator.generate_all_reports(scored_pairs, groups)
         
-        # 7. 결과 반환
+        # 10. 결과 반환
+        all_sanctions = critical_sanctions + ip_sanctions
         return {
             'config': self.config.to_dict(),
             'total_candidates': len(candidates),
@@ -1007,6 +1149,9 @@ class CooperativeTradingDetector:
             'risk_distribution': {k.value: v for k, v in risk_counts.items()},
             'total_groups': len(groups),
             'total_pnl': sum(g.pnl_total for g in groups),
+            'sanction_cases': len(all_sanctions),
+            'critical_sanctions': len(critical_sanctions),
+            'ip_sanctions': len(ip_sanctions),
             'output_directory': self.config.output_dir,
         }
     

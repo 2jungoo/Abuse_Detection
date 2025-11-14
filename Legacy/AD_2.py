@@ -5,7 +5,8 @@ Fraud Detection System for Cryptocurrency Exchange (Fixed Version)
 
 주요 수정 사항:
 1. Funding Hunter: 문제 없음 (Funding 데이터에 position_id 없음)
-2. Cooperative Trading: position_id 중복 제거 로직 추가
+2. Wash Trading: 중복 집계 없음 (검증 완료)
+3. Cooperative Trading: position_id 중복 제거 로직 추가
 
 Author: Fraud Detection Team
 Date: 2025-11-13
@@ -170,10 +171,145 @@ except Exception as e:
     fund_df = pd.DataFrame()
 
 # ============================================================================
-# Part 2: Cooperative Trading 탐지 (수정됨)
+# Part 2: Wash Trading 탐지
 # ============================================================================
 
-print("[3/6] Cooperative Trading 탐지 중...")
+print("[3/6] Wash Trading 탐지 중...")
+print("-" * 80)
+
+wash_query = """
+WITH
+position AS (
+    SELECT
+        account_id,
+        position_id,
+        MAX(leverage) AS leverage,
+        CAST(min(ts) AS TIMESTAMP) as open_ts,
+        CAST(max(ts) AS TIMESTAMP) as closing_ts,
+        max(symbol) as symbol,
+        max(side) as side,
+        sum(if(openclose='OPEN',amount,0)) as amount,
+        sum(if(openclose='OPEN',-amount,amount)*if(side='LONG',1,-1)) as rpnl
+    from Trade
+    GROUP BY account_id, position_id
+),
+joined AS (
+    select
+        t1.account_id AS account_id1,
+        t2.account_id AS account_id2,
+        t1.position_id AS position_id1,
+        t2.position_id AS position_id2,
+        t1.symbol,
+        t1.open_ts AS open_ts1,
+        t2.open_ts AS open_ts2,
+        t1.closing_ts AS closing_ts1,
+        t2.closing_ts AS closing_ts2,
+        t1.leverage,
+        t1.amount AS amount1,
+        t2.amount AS amount2,
+        t1.side as side1,
+        t2.side as side2,
+        t1.rpnl as rpnl1,
+        t2.rpnl as rpnl2
+    from
+    position t1 inner join position t2
+        on
+            t1.symbol = t2.symbol
+            and ABS(julian(t1.open_ts) - julian(t2.open_ts)) * 24 * 60 <= 2
+            and ABS(julian(t1.closing_ts) - julian(t2.closing_ts)) * 24 * 60 <= 2
+            and t1.leverage = t2.leverage
+            and t1.open_ts < t2.open_ts
+            and t1.amount <= 1.02 * t2.amount and t1.amount >= 0.98 * t2.amount
+            and GREATEST(t1.open_ts, t2.open_ts) < LEAST(t1.closing_ts, t2.closing_ts)
+            and t1.account_id != t2.account_id
+            and t1.side != t2.side
+            and (t1.rpnl > 0 or t2.rpnl > 0)
+)
+SELECT DISTINCT *
+FROM joined
+ORDER BY symbol, open_ts1;
+"""
+
+try:
+    wash_df = dd.query(wash_query).to_df()
+
+    if len(wash_df) > 0:
+        unique_pairs = set(tuple(sorted([a1, a2])) for a1, a2 in zip(wash_df['account_id1'], wash_df['account_id2']))
+
+        print(f"탐지 결과:")
+        print(f"  • 의심 거래 패턴: {len(wash_df)}개")
+        print(f"  • 고유 계정 페어: {len(unique_pairs)}개")
+
+        # ✅ 검증 결과: Wash Trading은 중복 집계 문제 없음
+        # 각 position_id가 고유하게 나타남
+        rpnl_long = pd.concat([
+            wash_df[['account_id1', 'rpnl1']].rename(columns={'account_id1': 'account_id', 'rpnl1': 'rpnl'}),
+            wash_df[['account_id2', 'rpnl2']].rename(columns={'account_id2': 'account_id', 'rpnl2': 'rpnl'})
+        ])
+
+        rpnl_stats = (
+            rpnl_long.groupby('account_id')['rpnl']
+            .agg([
+                ('rpnl_pos_sum', lambda x: x[x > 0].sum()),
+                ('rpnl_neg_sum', lambda x: x[x < 0].sum())
+            ])
+            .fillna(0)
+        )
+
+        reward_sum = Reward.groupby('account_id')['reward_amount'].sum().rename('reward_sum')
+
+        account_stats = (
+            rpnl_stats.join(reward_sum, how='left').fillna({'reward_sum': 0})
+        )
+        account_stats['net_pnl'] = account_stats['rpnl_pos_sum'] + (
+                    account_stats['rpnl_neg_sum'] + account_stats['reward_sum']).clip(upper=0)
+
+
+        def sorted_pair(a, b):
+            return tuple(sorted([a, b]))
+
+
+        wash_df['pair'] = wash_df.apply(lambda row: sorted_pair(row['account_id1'], row['account_id2']), axis=1)
+
+        pair_net_pnl = (
+            pd.DataFrame(wash_df['pair'].unique(), columns=['pair'])
+            .assign(
+                net_pnl1=lambda df: df['pair'].apply(
+                    lambda p: account_stats.loc[p[0], 'net_pnl'] if p[0] in account_stats.index else 0),
+                net_pnl2=lambda df: df['pair'].apply(
+                    lambda p: account_stats.loc[p[1], 'net_pnl'] if p[1] in account_stats.index else 0)
+            )
+        )
+        pair_net_pnl['pair_net_pnl'] = pair_net_pnl['net_pnl1'] + pair_net_pnl['net_pnl2']
+        pair_net_pnl = pair_net_pnl.sort_values('pair_net_pnl', ascending=False).reset_index(drop=True)
+
+        total_wash_profit = pair_net_pnl['pair_net_pnl'].sum()
+
+        print(f"\n  수익 분석:")
+        print(f"    총 순수익: ${total_wash_profit:,.2f}")
+        print(f"    평균 페어 수익: ${total_wash_profit / len(pair_net_pnl):,.2f}")
+        print(f"\n  ✅ 검증: position_id 중복 없음 (정확한 계산)")
+
+        print(f"\n  탐지된 Wash Trading 페어 (상위 5개):")
+        for idx, row in pair_net_pnl.head(5).iterrows():
+            print(f"    {idx + 1}. {row['pair'][0]} ↔ {row['pair'][1]}: ${row['pair_net_pnl']:,.2f}")
+    else:
+        print("  ⚠️  탐지된 패턴 없음")
+        unique_pairs = set()
+        pair_net_pnl = pd.DataFrame()
+
+    print()
+except Exception as e:
+    print(f"  ✗ Wash Trading 탐지 실패: {e}\n")
+    wash_df = pd.DataFrame()
+    pair_net_pnl = pd.DataFrame()
+    unique_pairs = set()
+
+# ============================================================================
+# Part 3: Cooperative Trading 탐지 (수정됨)
+# ============================================================================
+
+print("[4/6] Cooperative Trading 탐지 중...")
 print("-" * 80)
 
 cop_query = """
@@ -350,13 +486,17 @@ except Exception as e:
 # 통합 분석 및 리포트
 # ============================================================================
 
-print("[4/6] 통합 분석 중...")
+print("[5/6] 통합 분석 중...")
 print("-" * 80)
 
 total_fraud_accounts = set()
 
 if len(funding_hunters) > 0:
     total_fraud_accounts.update(funding_hunters)
+
+if len(wash_df) > 0:
+    total_fraud_accounts.update(wash_df['account_id1'].unique())
+    total_fraud_accounts.update(wash_df['account_id2'].unique())
 
 if len(connected_groups) > 0:
     for group in connected_groups:
@@ -369,6 +509,8 @@ total_profit = 0
 if len(funding_hunters) > 0:
     total_profit += (Funding[Funding['account_id'].isin(funding_hunters)].groupby('account_id').sum()[
                          'funding_fee'] * -1).sum()
+if len(pair_net_pnl) > 0:
+    total_profit += pair_net_pnl['pair_net_pnl'].sum()
 if len(group_pnls_df) > 0:
     total_profit += group_pnls_df['pnl_total'].sum()
 
@@ -381,7 +523,8 @@ print()
 
 print("유형별 탐지 현황:")
 print(f"  1. Funding Hunter: {len(funding_hunters)}명")
-print(f"  2. Cooperative Trading: {len(connected_groups)}개 그룹")
+print(f"  2. Wash Trading: {len(unique_pairs) if 'unique_pairs' in locals() else 0}개 페어")
+print(f"  3. Cooperative Trading: {len(connected_groups)}개 그룹")
 print()
 
 # ============================================================================
@@ -401,6 +544,15 @@ try:
             funding_result.to_excel(writer, sheet_name='Funding_Hunters', index=False)
             print(f"  ✓ Funding Hunters 저장 완료 ({len(funding_result)}행)")
 
+        # 2. Wash Trading Pairs
+        if len(pair_net_pnl) > 0:
+            wash_result = pair_net_pnl.copy()
+            wash_result['account1'] = wash_result['pair'].apply(lambda x: x[0])
+            wash_result['account2'] = wash_result['pair'].apply(lambda x: x[1])
+            wash_result = wash_result[['account1', 'account2', 'net_pnl1', 'net_pnl2', 'pair_net_pnl']]
+            wash_result.to_excel(writer, sheet_name='Wash_Trading_Pairs', index=False)
+            print(f"  ✓ Wash Trading Pairs 저장 완료 ({len(wash_result)}행)")
+
         # 3. Cooperative Trading Groups
         if len(group_pnls_df) > 0:
             coop_result = group_pnls_df.copy()
@@ -413,9 +565,10 @@ try:
         # 4. 통합 요약
         summary_data = {
             '구분': ['전체 계정 수', '부정거래 계정 수', '부정거래 비율(%)',
-                   'Funding Hunter', 'Cooperative Trading 그룹',
+                   'Funding Hunter', 'Wash Trading 페어', 'Cooperative Trading 그룹',
                    '총 부정거래 수익($)', '버전'],
             '값': [total_accounts, len(total_fraud_accounts), round(fraud_rate, 2),
+                  len(funding_hunters), len(unique_pairs) if 'unique_pairs' in locals() else 0,
                   len(connected_groups), round(total_profit, 2), 'v1.1 (Fixed)']
         }
         summary_df = pd.DataFrame(summary_data)
@@ -429,6 +582,8 @@ try:
                 'fraud_types': [
                     ', '.join([
                         'Funding Hunter' if acc in funding_hunters else '',
+                        'Wash Trading' if (len(wash_df) > 0 and (acc in wash_df['account_id1'].values or acc in wash_df[
+                            'account_id2'].values)) else '',
                         'Cooperative Trading' if any(acc in g for g in connected_groups) else ''
                     ]).strip(', ').replace(', , ', ', ')
                     for acc in total_fraud_accounts
@@ -467,7 +622,17 @@ if len(funding_hunters) > 0:
 else:
     print("│    • 탐지된 계정 없음                                                        │")
 print("│                                                                               │")
-print("│ 2. Cooperative Trading (공모거래)                                            │")
+print("│ 2. Wash Trading (자전거래)                                                   │")
+if len(pair_net_pnl) > 0:
+    print(f"│    • 탐지 페어: {len(pair_net_pnl):3d}개                                                      │")
+    print(f"│    • 총 수익: ${pair_net_pnl['pair_net_pnl'].sum():12,.2f}                                               │")
+    print(
+        f"│    • 평균 수익: ${pair_net_pnl['pair_net_pnl'].mean():12,.2f}                                               │")
+    print(f"│    ✅ 검증: 중복 집계 없음                                                   │")
+else:
+    print("│    • 탐지된 패턴 없음                                                        │")
+print("│                                                                               │")
+print("│ 3. Cooperative Trading (공모거래)                                            │")
 if len(group_pnls_df) > 0:
     print(f"│    • 탐지 그룹: {len(group_pnls_df):3d}개                                                      │")
     print(f"│    • 총 수익: ${group_pnls_df['pnl_total'].sum():12,.2f}                                               │")

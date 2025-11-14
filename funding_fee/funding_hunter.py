@@ -34,6 +34,13 @@ class SeverityLevel(Enum):
     LOW = "LOW"                # 낮은 의심
 
 
+class SanctionType(Enum):
+    """제재 유형"""
+    IMMEDIATE_CRITICAL = "IMMEDIATE_CRITICAL"      # Critical 즉시 제재
+    REPEATED_ABUSE = "REPEATED_ABUSE"              # 반복 악용
+    ACCOUNT_PATTERN = "ACCOUNT_PATTERN"            # 계정 패턴
+
+
 @dataclass
 class DetectionConfig:
     """탐지 설정 및 하이퍼파라미터"""
@@ -145,6 +152,36 @@ class AccountSummary:
     
     def to_dict(self) -> Dict:
         return asdict(self)
+
+
+@dataclass
+class SanctionCase:
+    """제재 케이스"""
+    case_id: str
+    sanction_type: SanctionType
+    account_id: str
+    detection_timestamp: datetime
+    
+    # 증거 데이터
+    hunter_case_ids: List[str]
+    total_score: float
+    severity: SeverityLevel
+    
+    # 반복 정보
+    abuse_count: Optional[int] = None
+    
+    # 추가 메타데이터
+    total_funding_profit: float = 0.0
+    account_total_funding: float = 0.0
+    evidence_summary: str = ""
+    
+    def to_dict(self) -> Dict:
+        """딕셔너리로 변환"""
+        data = asdict(self)
+        data['sanction_type'] = self.sanction_type.value
+        data['severity'] = self.severity.value
+        data['detection_timestamp'] = self.detection_timestamp.isoformat()
+        return data
 
 
 # ============================================================================
@@ -587,7 +624,114 @@ class AccountAnalyzer:
 
 
 # ============================================================================
-# 8. REPORTING & VISUALIZATION
+# 8. SANCTION PIPELINE
+# ============================================================================
+
+class SanctionPipeline:
+    """제재 케이스 생성 및 출력"""
+    
+    def __init__(self, config: DetectionConfig, logger: DetectionLogger):
+        self.config = config
+        self.logger = logger
+        self.sanction_cases: List[SanctionCase] = []
+    
+    def process_critical_cases(self, cases: List[FundingHunterCase]) -> List[SanctionCase]:
+        """Critical 심각도 즉시 제재 케이스 생성"""
+        print("Critical 케이스 제재 생성 중...")
+        
+        critical_cases = [c for c in cases if c.severity == SeverityLevel.CRITICAL]
+        
+        if len(critical_cases) == 0:
+            print("Critical 케이스 없음")
+            return []
+        
+        for case in critical_cases:
+            sanction = SanctionCase(
+                case_id=f"SANCTION_CRITICAL_{case.case_id}",
+                sanction_type=SanctionType.IMMEDIATE_CRITICAL,
+                account_id=case.account_id,
+                detection_timestamp=datetime.now(),
+                hunter_case_ids=[case.case_id],
+                total_score=case.score.total,
+                severity=SeverityLevel.CRITICAL,
+                total_funding_profit=case.window_funding,
+                account_total_funding=case.account_total_funding,
+                evidence_summary=f"확실한 펀딩비 악용 패턴 (점수: {case.score.total:.1f}/100)"
+            )
+            
+            self.sanction_cases.append(sanction)
+            self.logger.logger.warning(f"제재 케이스 생성: {sanction.case_id}")
+        
+        print(f"Critical 제재: {len(critical_cases)}건")
+        
+        return [c for c in self.sanction_cases if c.sanction_type == SanctionType.IMMEDIATE_CRITICAL]
+    
+    def process_account_analysis(
+        self, 
+        account_summaries: Dict[str, AccountSummary],
+        cases: List[FundingHunterCase]
+    ) -> List[SanctionCase]:
+        """계정 분석 기반 제재 케이스 생성"""
+        print("계정 분석 제재 케이스 생성 중...")
+        
+        account_sanctions = []
+        
+        # 반복 악용 계정 제재 (Critical 또는 High가 2건 이상)
+        repeat_accounts = {
+            acc_id: summary for acc_id, summary in account_summaries.items()
+            if summary.critical_count >= 1 or summary.high_count >= 2
+        }
+        
+        for account_id, summary in repeat_accounts.items():
+            # 이미 Critical로 제재된 경우 스킵
+            if any(c.account_id == account_id and c.sanction_type == SanctionType.IMMEDIATE_CRITICAL 
+                   for c in self.sanction_cases):
+                continue
+            
+            sanction = SanctionCase(
+                case_id=f"SANCTION_REPEAT_{account_id}",
+                sanction_type=SanctionType.REPEATED_ABUSE,
+                account_id=account_id,
+                detection_timestamp=datetime.now(),
+                hunter_case_ids=summary.case_ids,
+                total_score=summary.avg_score,
+                severity=SeverityLevel.HIGH if summary.critical_count == 0 else SeverityLevel.CRITICAL,
+                abuse_count=summary.total_cases,
+                total_funding_profit=summary.total_funding_profit,
+                account_total_funding=summary.account_total_funding,
+                evidence_summary=f"반복 펀딩비 악용 ({summary.total_cases}회, Critical:{summary.critical_count}, High:{summary.high_count})"
+            )
+            
+            account_sanctions.append(sanction)
+            self.sanction_cases.append(sanction)
+            self.logger.logger.warning(f"제재 케이스 생성: {sanction.case_id}")
+        
+        print(f"반복 악용 제재: {len(account_sanctions)}건")
+        
+        return account_sanctions
+    
+    def export_sanctions(self, output_dir: Path) -> str:
+        """제재 케이스를 JSON 파일로 출력"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filepath = output_dir / "sanction_accounts.json"
+        
+        data = {
+            'total_sanction_accounts': len(set(c.account_id for c in self.sanction_cases)),
+            'total_sanctions': len(self.sanction_cases),
+            'generated_at': datetime.now().isoformat(),
+            'sanctions': [case.to_dict() for case in self.sanction_cases]
+        }
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        print(f"제재 케이스 저장: {filepath} ({len(self.sanction_cases)}건)")
+        
+        return str(filepath)
+
+
+# ============================================================================
+# 9. REPORTING & VISUALIZATION
 # ============================================================================
 
 class ReportGenerator:
@@ -618,9 +762,6 @@ class ReportGenerator:
         
         # 4. 요약 보고서 (텍스트)
         self._generate_summary_report(all_cases, account_summaries)
-        
-        # 5. 제재 대상 계정 (JSON)
-        self._export_sanction_accounts(account_summaries)
         
         print("보고서 생성 완료")
     
@@ -793,31 +934,10 @@ class ReportGenerator:
         
         print(f"요약 보고서 저장: {filepath}")
         print(report)
-    
-    def _export_sanction_accounts(self, account_summaries: Dict[str, AccountSummary]):
-        """제재 대상 계정 JSON"""
-        
-        # Critical 또는 High가 2건 이상인 계정
-        sanction_accounts = [
-            summary for summary in account_summaries.values()
-            if summary.critical_count >= 1 or summary.high_count >= 2
-        ]
-        
-        sanction_data = {
-            'total_sanction_accounts': len(sanction_accounts),
-            'generated_at': datetime.now().isoformat(),
-            'accounts': [acc.to_dict() for acc in sanction_accounts]
-        }
-        
-        filepath = self.output_dir / "sanction_accounts.json"
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(sanction_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"제재 계정 저장: {filepath} ({len(sanction_accounts)}개)")
 
 
 # ============================================================================
-# 9. MAIN DETECTOR ENGINE
+# 10. MAIN DETECTOR ENGINE
 # ============================================================================
 
 class FundingHunterDetector:
@@ -831,6 +951,7 @@ class FundingHunterDetector:
         self.filter_engine = FilterEngine(config)
         self.scoring_engine = ScoringEngine(config)
         self.account_analyzer = AccountAnalyzer(config)
+        self.sanction_pipeline = SanctionPipeline(config, self.logger)
         self.report_generator = ReportGenerator(config)
     
     def detect(self, data_filepath: str) -> Dict:
@@ -875,11 +996,26 @@ class FundingHunterDetector:
         self.logger.log_phase("계정별 분석")
         account_summaries = self.account_analyzer.analyze_accounts(scored_cases)
         
-        # 6. 보고서 생성
+        # 6. Critical 케이스 즉시 제재
+        self.logger.log_phase("Critical 케이스 제재")
+        critical_sanctions = self.sanction_pipeline.process_critical_cases(scored_cases)
+        
+        # 7. 계정 분석 기반 제재
+        self.logger.log_phase("계정 분석 제재")
+        account_sanctions = self.sanction_pipeline.process_account_analysis(
+            account_summaries, scored_cases
+        )
+        
+        # 8. 제재 케이스 출력
+        self.logger.log_phase("제재 케이스 출력")
+        sanction_file = self.sanction_pipeline.export_sanctions(Path(self.config.output_dir))
+        
+        # 9. 보고서 생성
         self.logger.log_phase("보고서 생성")
         self.report_generator.generate_all_reports(scored_cases, account_summaries)
         
-        # 7. 결과 반환
+        # 10. 결과 반환
+        all_sanctions = critical_sanctions + account_sanctions
         return {
             'config': self.config.to_dict(),
             'total_candidates': len(candidates),
@@ -887,6 +1023,9 @@ class FundingHunterDetector:
             'severity_distribution': {k.value: v for k, v in severity_counts.items()},
             'total_accounts': len(account_summaries),
             'total_funding_profit': sum(s.total_funding_profit for s in account_summaries.values()),
+            'sanction_cases': len(all_sanctions),
+            'critical_sanctions': len(critical_sanctions),
+            'account_sanctions': len(account_sanctions),
             'output_directory': self.config.output_dir,
         }
     
