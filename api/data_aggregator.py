@@ -271,6 +271,7 @@ class DataAggregator:
                 
                 # 실제 거래 시간 사용 (loser의 계정/심볼 기준)
                 loser = pair.get('loser_account')
+                winner = pair.get('winner_account')
                 symbol = pair.get('symbol')
                 timestamp = pair_times.get((loser, symbol)) if loser and symbol else None
                 if timestamp:
@@ -283,19 +284,27 @@ class DataAggregator:
                     # fallback: 현재 시간
                     timestamp_ms = int(datetime.now().timestamp() * 1000)
                 
+                # raw 데이터에 명시적으로 필드 추가
+                raw_data = dict(pair)
+                raw_data['winner_account'] = winner
+                raw_data['loser_account'] = loser
+                raw_data['laundered_amount'] = pair.get('laundered_amount', 0)
+                
                 detections.append({
                     'id': pair_id,
                     'model': 'wash',
                     'timestamp': timestamp_ms,
                     'type': pair.get('tier', ''),
-                    'accounts': [pair.get('winner_account', ''), pair.get('loser_account', '')],
+                    'accounts': [winner, loser],
                     'score': float(pair.get('total_score', 0)),
                     'is_sanctioned': sanction_info.get('is_sanctioned', False),
                     'sanction_id': sanction_info.get('sanction_id', ''),
                     'sanction_type': sanction_info.get('sanction_type', ''),
                     'details': f"Tier: {pair.get('tier', '')}, Laundered: ${pair.get('laundered_amount', 0):.2f}",
                     'laundered_amount': float(pair.get('laundered_amount', 0)),
-                    'raw': pair,
+                    'winner_account': winner,
+                    'loser_account': loser,
+                    'raw': raw_data,
                 })
         
         # Funding 탐지 케이스

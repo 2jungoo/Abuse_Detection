@@ -1,6 +1,10 @@
 
 /venv
-/output
+# /output
 __pycache__/
 *.pyc
 problem_data_final.xlsx
+*/problem_data_final.xlsx
+*.xlsx
+*/output
+output/*
