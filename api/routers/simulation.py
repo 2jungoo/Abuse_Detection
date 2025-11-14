@@ -67,6 +67,8 @@ async def advance_simulation(request: AdvanceRequest):
         # 2. 탐지 모델 재실행
         print("Running detection models...")
         script_path = Path(__file__).parent.parent.parent / "run_all_detections.py"
+
+        dm.close_connection()
         
         result = subprocess.run(
             [sys.executable, str(script_path)],
@@ -74,6 +76,8 @@ async def advance_simulation(request: AdvanceRequest):
             text=True,
             cwd=str(script_path.parent)
         )
+
+        dm.reopen_connection()
         
         if result.returncode != 0:
             print(f"Detection failed: {result.stderr}")
@@ -128,6 +132,8 @@ async def reset_simulation():
         # 2. 탐지 모델 재실행
         print("Running detection models...")
         script_path = Path(__file__).parent.parent.parent / "run_all_detections.py"
+
+        dm.close_connection()
         
         result = subprocess.run(
             [sys.executable, str(script_path)],
@@ -135,6 +141,8 @@ async def reset_simulation():
             text=True,
             cwd=str(script_path.parent)
         )
+
+        dm.reopen_connection()
         
         if result.returncode != 0:
             print(f"Detection failed: {result.stderr}")

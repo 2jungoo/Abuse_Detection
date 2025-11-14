@@ -466,6 +466,31 @@ class DataManager:
             except Exception:
                 # best-effort: continue
                 continue
+    
+    def close_connection(self):
+        """Close the persistent connection if it exists."""
+        if self._con is not None:
+            try:
+                self._con.close()
+                print("--- [DataManager] ---")
+                print("Database connection closed.")
+                print("---------------------\n")
+            except Exception as e:
+                print(f"Error closing connection: {e}")
+            self._con = None
+
+    def reopen_connection(self) -> duckdb.DuckDBPyConnection:
+        """Re-establish the persistent connection."""
+        if self._con is None:
+            try:
+                self._con = duckdb.connect(database=str(self.duckdb_path))
+                print("--- [DataManager] ---")
+                print("Database connection reopened.")
+                print("---------------------\n")
+            except Exception as e:
+                print(f"Error reopening connection: {e}")
+                raise e
+        return self.get_connection(persistent=True) # 기존 get_connection 로직 재사용
 
 
 _GLOBAL_MANAGER: Optional[DataManager] = None

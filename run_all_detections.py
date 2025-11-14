@@ -30,16 +30,6 @@ def run_all_detections(data_filepath: str = "problem_data_final.xlsx"):
     
     results = {}
 
-    # --- Initialize DataManager: DO NOT seed_full_and_model here
-    # DataManager initialization is handled by main.py or simulation API
-    # This script only runs detection on existing model tables
-    try:
-        from common.data_manager import get_data_manager
-        dm = get_data_manager(data_filepath)
-        print("DataManager: connected to existing database.")
-    except Exception as e:
-        print(f"DataManager initialization failed: {e}")
-    
     # 1. Bonus Laundering 탐지
     print("\n" + "🎁 " + "="*76)
     print("1/3: Bonus Laundering (증정금 녹이기) 탐지 시작...")
